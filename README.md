@@ -1,4 +1,4 @@
-# Duplicati Docker Stop/Start Script
+# Duplicati Docker 'By Label' Stop/Start Script
 
 This setup allows Duplicati to temporarily stop selected Docker containers before a backup starts, then restart only those same containers after the backup completes.
 
