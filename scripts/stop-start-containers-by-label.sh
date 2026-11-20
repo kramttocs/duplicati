@@ -1,4 +1,12 @@
 #!/bin/bash
+#
+# Duplicati advanced options (use the existing script path inside container):
+#   --run-script-before-required=/path/to/stop-start-containers-by-label.sh
+#   --run-script-after=/path/to/stop-start-containers-by-label.sh
+#
+# BEFORE aborts (exit 5) if a stop fails, and tries to restart containers
+# already stopped. AFTER (or a manually invoked AFTER) retries restart state.
+# Do not configure both before and before-required hooks.
 
 # Docker label used to map a Duplicati backup job to one or more containers.
 #
@@ -113,6 +121,13 @@ stop_container_if_running() {
     return 1
   fi
 
+  # Record before stopping, so a successful stop is not forgotten if Docker
+  # inspection or the script itself fails immediately afterward.
+  if ! printf '%s\n' "$cont_name" >> "$state_file"; then
+    log "Could not record container for restart; refusing to stop: ${cont_name}"
+    return 1
+  fi
+
   log "Stopping container: ${cont_name}"
 
   docker_output="$(docker stop "$cont_name" 2>&1)"
@@ -139,7 +154,6 @@ stop_container_if_running() {
 
   if [[ "$docstate" == "false" ]]; then
     log "Container ${cont_name} stopped..."
-    printf '%s\n' "$cont_name" >> "$state_file"
     return 0
   fi
 
@@ -209,6 +223,36 @@ start_container_if_needed() {
   return 1
 }
 
+# Used both for AFTER and for rolling back a failed BEFORE. Only remove
+# restart state when every queued container is running again.
+restart_queued_containers() {
+  local state_file="$1"
+  local cont_name
+  local start_failures=0
+
+  [[ -s "$state_file" ]] || return 0
+
+  while IFS= read -r cont_name; do
+    [[ -z "$cont_name" ]] && continue
+    if ! start_container_if_needed "$cont_name"; then
+      start_failures=1
+    fi
+  done < <(tac "$state_file")
+
+  if [[ "$start_failures" -ne 0 ]]; then
+    log "One or more containers could not be restarted; state kept: ${state_file}"
+    return 1
+  fi
+
+  if ! rm -f -- "$state_file"; then
+    log "All containers handled, but could not remove state file: ${state_file}"
+    return 1
+  fi
+
+  log "Removed restart state file: ${state_file}"
+  return 0
+}
+
 # Duplicati variables.
 dupdocker="$(trim_value "${DUPLICATI__backup_name:-}")"
 dupevent="$(trim_value "${DUPLICATI__EVENTNAME:-}")"
@@ -237,7 +281,8 @@ if [[ -z "$dupdocker" ]]; then
   log "Duplicati 'DUPLICATI__backup_name' is empty. Cannot match Docker containers."
   log "Script stopped: $(date)"
   log "===>>>"
-  exit 0
+  if [[ "$dupevent" == "BEFORE" ]]; then exit 5; fi
+  exit 1
 fi
 
 safe_job_name="$(safe_filename "$dupdocker")"
@@ -250,18 +295,24 @@ if [[ "$dupevent" == "BEFORE" ]]; then
   if ! find_matching_containers "$dupdocker"; then
     log "Script stopped with error before any containers were changed: $(date)"
     log "===>>>"
-    exit 1
+    exit 5
   fi
 
+  # Do not mix an unfinished earlier run into this run's rollback.
+  # First run AFTER manually to recover the old containers.
   if [[ -s "$STATE_FILE" ]]; then
-    log "Warning: existing state file found from a previous run: ${STATE_FILE}"
-    log "This run will replace it with a fresh stopped-container list."
+    log "Pending restart state from an earlier run: ${STATE_FILE}"
+    log "Backup skipped. Run AFTER to recover those containers first."
+    exit 5
   fi
 
-  # Clear previous state only after Docker lookup succeeds.
-  : > "$STATE_FILE"
+  if ! touch "$STATE_FILE"; then
+    log "Cannot create restart state file; backup skipped."
+    exit 5
+  fi
 
   if [[ ${#MATCHED_CONTAINERS[@]} -eq 0 ]]; then
+    rm -f -- "$STATE_FILE" || true
     log "No containers found with label ${BACKUP_LABEL_KEY} matching value: ${dupdocker}"
     log "Script stopped: $(date)"
     log "===>>>"
@@ -279,6 +330,7 @@ if [[ "$dupevent" == "BEFORE" ]]; then
   for cont_name in "${MATCHED_CONTAINERS[@]}"; do
     if ! stop_container_if_running "$cont_name" "$STATE_FILE"; then
       stop_failures=1
+      break  # Do not stop more containers after the first failure.
     fi
   done
 
@@ -294,8 +346,12 @@ if [[ "$dupevent" == "BEFORE" ]]; then
   fi
 
   if [[ "$stop_failures" -ne 0 ]]; then
-    log "One or more containers could not be stopped cleanly."
-    log "Continuing so the AFTER event can restart any containers that were stopped."
+    log "Stop failed; attempting to restart all containers queued by BEFORE."
+    if ! restart_queued_containers "$STATE_FILE"; then
+      log "Rollback incomplete. Restart state was kept for manual AFTER recovery."
+    fi
+    log "Backup skipped because a container could not be stopped cleanly."
+    exit 5
   fi
 
 elif [[ "$dupevent" == "AFTER" ]]; then
@@ -308,28 +364,13 @@ elif [[ "$dupevent" == "AFTER" ]]; then
     exit 0
   fi
 
-  log "Starting only containers that were stopped by the BEFORE event:"
+  log "Starting only containers recorded by the BEFORE event, in reverse stop order:"
 
-  start_failures=0
-
-  while IFS= read -r cont_name; do
-    [[ -z "$cont_name" ]] && continue
-
-    if ! start_container_if_needed "$cont_name"; then
-      start_failures=1
-    fi
-  done < "$STATE_FILE"
-
-  if [[ "$start_failures" -ne 0 ]]; then
-    log "One or more containers could not be started cleanly."
-    log "State file was kept so this can be retried: ${STATE_FILE}"
+  if ! restart_queued_containers "$STATE_FILE"; then
     log "Script stopped with error: $(date)"
     log "===>>>"
     exit 1
   fi
-
-  rm -f "$STATE_FILE"
-  log "Removed state file: ${STATE_FILE}"
 
 else
   log "Duplicati 'DUPLICATI__EVENTNAME' not recognized: ${dupevent}"
